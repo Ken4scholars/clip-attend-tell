@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 import torchvision
+import clip
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -51,6 +53,51 @@ class Encoder(nn.Module):
                 p.requires_grad = fine_tune
 
 
+class CLIPLoader:
+    _clip_obj_name = '_clip_model'
+
+    def load_clip(self):
+        setattr(self, self._clip_obj_name, clip.load("ViT-B/32", device=device)[0])
+
+    @property
+    def clip_model(self):
+        if not hasattr(self, self._clip_obj_name):
+            self.load_clip()
+        return getattr(self, self._clip_obj_name)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_modules'].pop(self._clip_obj_name, None)
+        return state
+
+
+class CLIPEncoder(CLIPLoader, nn.Module):
+    """
+    Encoder based on pre-trained CLIP https://github.com/openai/CLIP
+    """
+
+    def __init__(self, encoded_image_size=14):
+        super().__init__()
+        self.enc_image_size = encoded_image_size
+
+        # Resize image to fixed size to allow input images of variable size
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((encoded_image_size, encoded_image_size))
+
+    def forward(self, images):
+        """
+        Forward propagation.
+
+        :param images: images, a tensor of dimensions (batch_size, 3, image_size, image_size)
+        :return: encoded images
+        """
+        with torch.no_grad():
+            out = self.clip_model.encode_image(images).float()
+        out = out.view(out.shape[0], -1, 16, 16)
+        out = self.adaptive_pool(out)  # (batch_size, 2048, encoded_image_size, encoded_image_size)
+        out = out.permute(0, 2, 3, 1)  # (batch_size, encoded_image_size, encoded_image_size, 2048)
+        return out
+
+
 class Attention(nn.Module):
     """
     Attention Network.
@@ -86,12 +133,38 @@ class Attention(nn.Module):
         return attention_weighted_encoding, alpha
 
 
+class CLIPEmbedding(CLIPLoader, nn.Module):
+    def __init__(self, embed_dim, word_map):
+        super().__init__()
+        self.word_map = word_map
+        self.rev_word_map = {v: k for k, v in word_map.items()}
+        self.embed_dim = embed_dim
+
+    def forward(self, captions):
+        special_words = ['<unk>', '<start>', '<end>', '<pad>']
+        special_words_enc = [self.word_map[w] for w in special_words]
+        text = []
+        for cap in captions:
+            cap_words = [self.rev_word_map[w] for w in cap[1:-1].tolist() if w not in special_words_enc]
+            text.append(' '.join(cap_words))
+        text = clip.tokenize(text).to(device)
+        with torch.no_grad():
+            embedding = self.clip_model.encode_text(text)
+        embedding = embedding.view(embedding.shape[0], self.embed_dim, -1)
+        adaptive_pool = nn.AdaptiveAvgPool1d(captions.shape[1])
+        embedding = adaptive_pool(embedding)
+        embedding = embedding.permute(0, 2, 1)
+
+        return embedding
+
+
 class DecoderWithAttention(nn.Module):
     """
     Decoder.
     """
 
-    def __init__(self, attention_dim, embed_dim, decoder_dim, vocab_size, encoder_dim=2048, dropout=0.5):
+    def __init__(self, attention_dim, embed_dim, decoder_dim, vocab_size, word_map,
+                 encoder_dim=2048, dropout=0.5, clip_embed=True):
         """
         :param attention_dim: size of attention network
         :param embed_dim: embedding size
@@ -101,6 +174,8 @@ class DecoderWithAttention(nn.Module):
         :param dropout: dropout
         """
         super(DecoderWithAttention, self).__init__()
+        if clip_embed:
+            encoder_dim = 2
 
         self.encoder_dim = encoder_dim
         self.attention_dim = attention_dim
@@ -110,8 +185,11 @@ class DecoderWithAttention(nn.Module):
         self.dropout = dropout
 
         self.attention = Attention(encoder_dim, decoder_dim, attention_dim)  # attention network
-
-        self.embedding = nn.Embedding(vocab_size, embed_dim)  # embedding layer
+        self.clip_embed = clip_embed
+        if clip_embed:
+            self.embedding = CLIPEmbedding(embed_dim, word_map)
+        else:
+            self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.dropout = nn.Dropout(p=self.dropout)
         self.decode_step = nn.LSTMCell(embed_dim + encoder_dim, decoder_dim, bias=True)  # decoding LSTMCell
         self.init_h = nn.Linear(encoder_dim, decoder_dim)  # linear layer to find initial hidden state of LSTMCell
@@ -125,7 +203,8 @@ class DecoderWithAttention(nn.Module):
         """
         Initializes some parameters with values from the uniform distribution, for easier convergence.
         """
-        self.embedding.weight.data.uniform_(-0.1, 0.1)
+        if not self.clip_embed:
+            self.embedding.weight.data.uniform_(-0.1, 0.1)
         self.fc.bias.data.fill_(0)
         self.fc.weight.data.uniform_(-0.1, 0.1)
 
@@ -135,7 +214,8 @@ class DecoderWithAttention(nn.Module):
 
         :param embeddings: pre-trained embeddings
         """
-        self.embedding.weight = nn.Parameter(embeddings)
+        if not self.clip_embed:
+            self.embedding.weight = nn.Parameter(embeddings)
 
     def fine_tune_embeddings(self, fine_tune=True):
         """
@@ -143,6 +223,8 @@ class DecoderWithAttention(nn.Module):
 
         :param fine_tune: Allow?
         """
+        if self.clip_embed:
+            return
         for p in self.embedding.parameters():
             p.requires_grad = fine_tune
 
