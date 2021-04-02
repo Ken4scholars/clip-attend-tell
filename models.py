@@ -61,7 +61,7 @@ class CLIPLoader:
 
     @property
     def clip_model(self):
-        if not hasattr(self, self._clip_obj_name):
+        if not getattr(self, self._clip_obj_name, None):
             self.load_clip()
         return getattr(self, self._clip_obj_name)
 
@@ -82,6 +82,7 @@ class CLIPEncoder(CLIPLoader, nn.Module):
 
         # Resize image to fixed size to allow input images of variable size
         self.adaptive_pool = nn.AdaptiveAvgPool2d((encoded_image_size, encoded_image_size))
+        self.conv_out = nn.Conv2d(2, 2048, 3, padding=1)
 
     def forward(self, images):
         """
@@ -90,12 +91,27 @@ class CLIPEncoder(CLIPLoader, nn.Module):
         :param images: images, a tensor of dimensions (batch_size, 3, image_size, image_size)
         :return: encoded images
         """
-        with torch.no_grad():
-            out = self.clip_model.encode_image(images).float()
-        out = out.view(out.shape[0], -1, 16, 16)
-        out = self.adaptive_pool(out)  # (batch_size, 2048, encoded_image_size, encoded_image_size)
+        # with torch.no_grad():
+        out = self.clip_model.encode_image(images).float()  # (batch_size, 512)
+        out = out.view(out.shape[0], -1, 16, 16)  # (batch_size, 2, 16, 16)
+        out = self.adaptive_pool(out)  # (batch_size, 2, encoded_image_size, encoded_image_size)
+        out = self.conv_out(out)  # (batch_size, 2048, encoded_image_size, encoded_image_size)
         out = out.permute(0, 2, 3, 1)  # (batch_size, encoded_image_size, encoded_image_size, 2048)
         return out
+
+    def fine_tune(self, fine_tune=True):
+        """
+        Allow or prevent the computation of gradients for some layers of the encoder.
+
+        :param fine_tune: Allow?
+        """
+        for p in self.resnet.parameters():
+            p.requires_grad = False
+        # If fine-tuning, only fine-tune the last 3 ViT layers
+        vit = list(self.clip_model.children())[0]
+        for c in list(self.resnet.children())[-3:]:
+            for p in c.parameters():
+                p.requires_grad = fine_tune
 
 
 class Attention(nn.Module):
@@ -144,6 +160,7 @@ class CLIPEmbedding(CLIPLoader, nn.Module):
         special_words = ['<unk>', '<start>', '<end>', '<pad>']
         special_words_enc = [self.word_map[w] for w in special_words]
         text = []
+        print(captions)
         for cap in captions:
             cap_words = [self.rev_word_map[w] for w in cap[1:-1].tolist() if w not in special_words_enc]
             text.append(' '.join(cap_words))
@@ -164,7 +181,7 @@ class DecoderWithAttention(nn.Module):
     """
 
     def __init__(self, attention_dim, embed_dim, decoder_dim, vocab_size, word_map,
-                 encoder_dim=2048, dropout=0.5, clip_embed=True):
+                 encoder_dim=2048, dropout=0.5, clip_encoded=True, clip_embed=True):
         """
         :param attention_dim: size of attention network
         :param embed_dim: embedding size
@@ -174,8 +191,8 @@ class DecoderWithAttention(nn.Module):
         :param dropout: dropout
         """
         super(DecoderWithAttention, self).__init__()
-        if clip_embed:
-            encoder_dim = 2
+        # if clip_encoded:
+        #     encoder_dim = 2
 
         self.encoder_dim = encoder_dim
         self.attention_dim = attention_dim

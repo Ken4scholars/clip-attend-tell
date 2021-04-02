@@ -37,7 +37,7 @@ grad_clip = 5.  # clip gradients at an absolute value of
 alpha_c = 1.  # regularization parameter for 'doubly stochastic attention', as in the paper
 best_bleu4 = 0.  # BLEU-4 score right now
 print_freq = 1  # print training/validation stats every __ batches
-fine_tune_encoder = False  # fine-tune encoder?
+fine_tune_encoder = True  # fine-tune encoder?
 checkpoint = None  # path to checkpoint, None if none
 model_save_dir = 'models/'
 
@@ -62,15 +62,15 @@ def main(use_clip=True):
                                        vocab_size=len(word_map),
                                        word_map=word_map,
                                        dropout=dropout,
-                                       clip_embed=use_clip)
+                                       clip_encoded=use_clip,
+                                       clip_embed=False)
         decoder_optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, decoder.parameters()),
                                              lr=decoder_lr)
         if use_clip:
             encoder = CLIPEncoder()
-            fine_tune_encoder = False
         else:
             encoder = Encoder()
-            encoder.fine_tune(fine_tune_encoder)
+        encoder.fine_tune(fine_tune_encoder)
         encoder_optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, encoder.parameters()),
                                              lr=encoder_lr) if fine_tune_encoder else None
 
