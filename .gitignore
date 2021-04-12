@@ -3,3 +3,5 @@ flickr
 models/
 captioning/
 .data/
+*.pt
+.venv/
