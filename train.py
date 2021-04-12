@@ -75,6 +75,7 @@ def main(use_clip=True):
                                              lr=encoder_lr) if fine_tune_encoder else None
 
     else:
+        clip_model_path = checkpoint.model[:-8] + '_clip.pt'
         checkpoint = torch.load(checkpoint)
         start_epoch = checkpoint['epoch'] + 1
         epochs_since_improvement = checkpoint['epochs_since_improvement']
@@ -82,6 +83,8 @@ def main(use_clip=True):
         decoder = checkpoint['decoder']
         decoder_optimizer = checkpoint['decoder_optimizer']
         encoder = checkpoint['encoder']
+        if use_clip:
+            encoder.load_clip_from_disk(clip_model_path)
         encoder_optimizer = checkpoint['encoder_optimizer']
         if fine_tune_encoder is True and encoder_optimizer is None:
             encoder.fine_tune(fine_tune_encoder)

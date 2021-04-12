@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -85,6 +87,41 @@ def caption_image_beam_search(encoder, decoder, image_path, word_map,
     step = 1
     h, c = decoder.init_hidden_state(encoder_out)
 
+    rev_word_map = {v: k for k, v in word_map.items()}
+
+    def get_clip_scores(seqs, scores):
+        special_words = ['<unk>', '<start>', '<end>', '<pad>']
+        special_words_enc = [word_map[w] for w in special_words]
+        if step == 1:
+            next_word_inds = scores[0].topk(k, 0, True, True)[1]  # (s)
+            return torch.zeros(k, device=device).long(), next_word_inds
+        next_word_inds = scores.topk(k)[1]
+        inds = []
+
+        text = []
+        for idx, (prev_seq, next_words) in enumerate(zip(seqs.tolist(), next_word_inds.tolist())):
+            prev_words = [rev_word_map[w] for w in prev_seq if w not in special_words_enc]
+            for word in next_words:
+                cap_words = prev_words + [rev_word_map[w] for w in [word] if w not in special_words_enc]
+                text.append(' '.join(cap_words))
+                inds.append([idx, word])
+        inds = np.array(inds)
+        text = clip.tokenize(text).to(device)
+        with torch.no_grad():
+            image_features = encoder.clip_model.encode_image(image)
+            text_features = encoder.clip_model.encode_text(text)
+
+        # Pick the top k most similar captions for the image
+        image_features /= image_features.norm(dim=-1, keepdim=True)
+        text_features /= text_features.norm(dim=-1, keepdim=True)
+        similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
+        indices = similarity.view(-1).topk(k, 0)[1]
+        prev_inds = torch.tensor([inds[idx][0] for idx in indices], device=device)
+        next_inds = torch.tensor([inds[idx][1] for idx in indices], device=device)
+
+        return prev_inds, next_inds
+
+
     # s is a number less than or equal to k, because sequences are removed from this process once they hit <end>
     while True:
 
@@ -100,21 +137,24 @@ def caption_image_beam_search(encoder, decoder, image_path, word_map,
         h, c = decoder.decode_step(torch.cat([embeddings, awe], dim=1), (h, c))  # (s, decoder_dim)
 
         scores = decoder.fc(h)  # (s, vocab_size)
-        scores = F.log_softmax(scores, dim=1)
-
-        # Add
-        scores = top_k_scores.expand_as(scores) + scores  # (s, vocab_size)
-
-        # For the first step, all k points will have the same scores (since same k previous words, h, c)
-        if step == 1:
-            top_k_scores, top_k_words = scores[0].topk(k, 0, True, True)  # (s)
+        if use_clip:
+            prev_word_inds, next_word_inds = get_clip_scores(seqs, scores)
         else:
-            # Unroll and find top scores, and their unrolled indices
-            top_k_scores, top_k_words = scores.view(-1).topk(k, 0, True, True)  # (s)
+            scores = F.log_softmax(scores, dim=1)
 
-        # Convert unrolled indices to actual indices of scores
-        prev_word_inds = (top_k_words / vocab_size).long()  # (s)
-        next_word_inds = (top_k_words % vocab_size).long()  # (s)
+            # Add
+            scores = top_k_scores.expand_as(scores) + scores  # (s, vocab_size)
+
+            # For the first step, all k points will have the same scores (since same k previous words, h, c)
+            if step == 1:
+                top_k_scores, top_k_words = scores[0].topk(k, 0, True, True)  # (s)
+            else:
+                # Unroll and find top scores, and their unrolled indices
+                top_k_scores, top_k_words = scores.view(-1).topk(k, 0, True, True)  # (s)
+
+            # Convert unrolled indices to actual indices of scores
+            prev_word_inds = (top_k_words / vocab_size).long()  # (s)
+            next_word_inds = (top_k_words % vocab_size).long()  # (s)
 
         # Add new words to sequences, alphas
         seqs = torch.cat([seqs[prev_word_inds], next_word_inds.unsqueeze(1)], dim=1)  # (s, step+1)
@@ -200,6 +240,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_clip', help='Use CLIP', type=bool, default=True)
     parser.add_argument('--img', '-i', help='path to image')
     parser.add_argument('--model', '-m', help='path to model')
+    parser.add_argument('--clip_model', '-cm', help='path to CLIP model')
     parser.add_argument('--word_map', '-wm', help='path to word map JSON')
     parser.add_argument('--beam_size', '-b', default=5, type=int, help='beam size for beam search')
     parser.add_argument('--dont_smooth', dest='smooth', action='store_false', help='do not smooth alpha overlay')
@@ -212,6 +253,11 @@ if __name__ == '__main__':
     decoder = decoder.to(device)
     decoder.eval()
     encoder = checkpoint['encoder']
+    clip_model_path = args.clip_model
+    if not clip_model_path:
+        clip_model_path = args.model[:-8] + '_clip.pt'
+    if args.use_clip and os.path.exists(clip_model_path):
+        encoder.load_clip_from_disk(clip_model_path)
     encoder = encoder.to(device)
     encoder.eval()
 

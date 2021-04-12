@@ -56,7 +56,26 @@ class Encoder(nn.Module):
 class CLIPLoader:
     _clip_obj_name = '_clip_model'
 
+    def save_clip(self, filename):
+        """
+        Save the CLIP model using the JIT module
+        as it cannot be saved with the other modules
+        :param filename: the full filepath to save
+        """
+        torch.jit.save(self.clip_model, filename)
+
+    def load_clip_from_disk(self, filename):
+        """
+        Load the CLIP model from disk as it was saved separately
+        Only call this after loading the containing model
+        :param filename: the full filepath to the CLIP model
+        """
+        setattr(self, self._clip_obj_name, torch.jit.load(filename, map_location=device))
+
     def load_clip(self):
+        """
+        load original pre-trained CLIP model from OpenAI
+        """
         setattr(self, self._clip_obj_name, clip.load("ViT-B/32", device=device)[0])
 
     @property
@@ -91,7 +110,6 @@ class CLIPEncoder(CLIPLoader, nn.Module):
         :param images: images, a tensor of dimensions (batch_size, 3, image_size, image_size)
         :return: encoded images
         """
-        # with torch.no_grad():
         out = self.clip_model.encode_image(images).float()  # (batch_size, 512)
         out = out.view(out.shape[0], -1, 16, 16)  # (batch_size, 2, 16, 16)
         out = self.adaptive_pool(out)  # (batch_size, 2, encoded_image_size, encoded_image_size)
@@ -107,9 +125,9 @@ class CLIPEncoder(CLIPLoader, nn.Module):
         """
         for p in self.resnet.parameters():
             p.requires_grad = False
-        # If fine-tuning, only fine-tune the last 3 ViT layers
+        # If fine-tuning, only fine-tune only the transformer layers
         vit = list(self.clip_model.children())[0]
-        for c in list(self.resnet.children())[-3:]:
+        for c in list(vit.children())[-3]:
             for p in c.parameters():
                 p.requires_grad = fine_tune
 
@@ -191,8 +209,6 @@ class DecoderWithAttention(nn.Module):
         :param dropout: dropout
         """
         super(DecoderWithAttention, self).__init__()
-        # if clip_encoded:
-        #     encoder_dim = 2
 
         self.encoder_dim = encoder_dim
         self.attention_dim = attention_dim

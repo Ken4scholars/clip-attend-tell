@@ -229,10 +229,15 @@ def save_checkpoint(data_name, epoch, epochs_since_improvement, encoder, decoder
              'encoder_optimizer': encoder_optimizer,
              'decoder_optimizer': decoder_optimizer}
     filename = 'checkpoint_' + data_name + '.pth.tar'
+    clip_filename = 'checkpoint_' + data_name + '_clip.pt'
     torch.save(state, save_dir + filename)
+    if hasattr(encoder, 'clip_model'):
+        encoder.save_clip(save_dir + clip_filename)
     # If this checkpoint is the best so far, store a copy so it doesn't get overwritten by a worse checkpoint
     if is_best:
         torch.save(state, save_dir + 'BEST_' + filename)
+        if hasattr(encoder, 'clip_model'):
+            encoder.save_clip(save_dir + 'BEST_' + clip_filename)
 
 
 class AverageMeter(object):
