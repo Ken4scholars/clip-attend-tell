@@ -2,6 +2,8 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import torchvision.transforms as transforms
+from clip import clip
+
 from datasets import *
 from utils import *
 from nltk.translate.bleu_score import corpus_bleu
@@ -9,19 +11,25 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 # Parameters
-data_folder = '/media/ssd/caption data'  # folder with data files saved by create_input_files.py
-data_name = 'coco_5_cap_per_img_5_min_word_freq'  # base name shared by data files
-checkpoint = '../BEST_checkpoint_coco_5_cap_per_img_5_min_word_freq.pth.tar'  # model checkpoint
-word_map_file = '/media/ssd/caption data/WORDMAP_coco_5_cap_per_img_5_min_word_freq.json'  # word map, ensure it's the same the data was encoded with and the model was trained with
+data_folder = 'flickr'  # folder with data files saved by create_input_files.py
+data_name = 'flickr8k_5_cap_per_img_5_min_word_freq'  # base name shared by data files
+checkpoint = 'models/BEST_checkpoint_flickr8k_5_cap_per_img_5_min_word_freq.pth.tar'  # model checkpoint
+clip_checkpoint = None
+word_map_file = 'flickr/WORDMAP_flickr8k_5_cap_per_img_5_min_word_freq.json'  # word map, ensure it's the same the data was encoded with and the model was trained with
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # sets device for model and PyTorch tensors
 cudnn.benchmark = True  # set to true only if inputs to model are fixed size; otherwise lot of computational overhead
+use_clip = True
 
 # Load model
-checkpoint = torch.load(checkpoint)
+if not clip_checkpoint:
+    clip_checkpoint = str(checkpoint[-8:]) + '_clip.pt'
+checkpoint = torch.load(checkpoint, map_location=device)
 decoder = checkpoint['decoder']
 decoder = decoder.to(device)
 decoder.eval()
 encoder = checkpoint['encoder']
+if os.path.exists(clip_checkpoint) and hasattr(encoder, 'clip_model'):
+    encoder.load_clip_from_disk(clip_checkpoint)
 encoder = encoder.to(device)
 encoder.eval()
 
@@ -44,8 +52,14 @@ def evaluate(beam_size):
     :return: BLEU-4 score
     """
     # DataLoader
+    _transforms = [normalize]
+    if use_clip:
+        _, preprocess = clip.load('ViT-B/32')
+        preprocess.transforms = preprocess.transforms[:2]
+        _transforms = preprocess.transforms + _transforms
+    _transforms = transforms.Compose(_transforms)
     loader = torch.utils.data.DataLoader(
-        CaptionDataset(data_folder, data_name, 'TEST', transform=transforms.Compose([normalize])),
+        CaptionDataset(data_folder, data_name, 'TEST', transform=_transforms),
         batch_size=1, shuffle=True, num_workers=1, pin_memory=True)
 
     # TODO: Batched Beam Search
@@ -95,6 +109,40 @@ def evaluate(beam_size):
         step = 1
         h, c = decoder.init_hidden_state(encoder_out)
 
+        rev_word_map = {v: k for k, v in word_map.items()}
+
+        def get_clip_scores(seqs, scores):
+            special_words = ['<unk>', '<start>', '<end>', '<pad>']
+            special_words_enc = [word_map[w] for w in special_words]
+            if step == 1:
+                next_word_inds = scores[0].topk(k, 0, True, True)[1]  # (s)
+                return torch.zeros(k, device=device).long(), next_word_inds
+            next_word_inds = scores.topk(k)[1]
+            inds = []
+
+            text = []
+            for idx, (prev_seq, next_words) in enumerate(zip(seqs.tolist(), next_word_inds.tolist())):
+                prev_words = [rev_word_map[w] for w in prev_seq if w not in special_words_enc]
+                for word in next_words:
+                    cap_words = prev_words + [rev_word_map[w] for w in [word] if w not in special_words_enc]
+                    text.append(' '.join(cap_words))
+                    inds.append([idx, word])
+            inds = np.array(inds)
+            text = clip.tokenize(text).to(device)
+            with torch.no_grad():
+                image_features = encoder.clip_model.encode_image(image)
+                text_features = encoder.clip_model.encode_text(text)
+
+            # Pick the top k most similar captions for the image
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+            similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
+            indices = similarity.view(-1).topk(k, 0)[1]
+            prev_inds = torch.tensor([inds[idx][0] for idx in indices], device=device)
+            next_inds = torch.tensor([inds[idx][1] for idx in indices], device=device)
+
+            return prev_inds, next_inds
+
         # s is a number less than or equal to k, because sequences are removed from this process once they hit <end>
         while True:
 
@@ -108,21 +156,24 @@ def evaluate(beam_size):
             h, c = decoder.decode_step(torch.cat([embeddings, awe], dim=1), (h, c))  # (s, decoder_dim)
 
             scores = decoder.fc(h)  # (s, vocab_size)
-            scores = F.log_softmax(scores, dim=1)
-
-            # Add
-            scores = top_k_scores.expand_as(scores) + scores  # (s, vocab_size)
-
-            # For the first step, all k points will have the same scores (since same k previous words, h, c)
-            if step == 1:
-                top_k_scores, top_k_words = scores[0].topk(k, 0, True, True)  # (s)
+            if use_clip:
+                prev_word_inds, next_word_inds = get_clip_scores(seqs, scores)
             else:
-                # Unroll and find top scores, and their unrolled indices
-                top_k_scores, top_k_words = scores.view(-1).topk(k, 0, True, True)  # (s)
+                scores = F.log_softmax(scores, dim=1)
 
-            # Convert unrolled indices to actual indices of scores
-            prev_word_inds = top_k_words / vocab_size  # (s)
-            next_word_inds = top_k_words % vocab_size  # (s)
+                # Add
+                scores = top_k_scores.expand_as(scores) + scores  # (s, vocab_size)
+
+                # For the first step, all k points will have the same scores (since same k previous words, h, c)
+                if step == 1:
+                    top_k_scores, top_k_words = scores[0].topk(k, 0, True, True)  # (s)
+                else:
+                    # Unroll and find top scores, and their unrolled indices
+                    top_k_scores, top_k_words = scores.view(-1).topk(k, 0, True, True)  # (s)
+
+                # Convert unrolled indices to actual indices of scores
+                prev_word_inds = (top_k_words / vocab_size).long() # (s)
+                next_word_inds = (top_k_words % vocab_size).long()  # (s)
 
             # Add new words to sequences
             seqs = torch.cat([seqs[prev_word_inds], next_word_inds.unsqueeze(1)], dim=1)  # (s, step+1)
