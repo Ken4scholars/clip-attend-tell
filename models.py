@@ -123,13 +123,13 @@ class CLIPEncoder(CLIPLoader, nn.Module):
 
         :param fine_tune: Allow?
         """
-        for p in self.resnet.parameters():
+        for p in self.clip_model.parameters():
             p.requires_grad = False
-        # If fine-tuning, only fine-tune only the transformer layers
+            # If fine-tuning, only fine-tune the last 3 ViT layers
         vit = list(self.clip_model.children())[0]
-        for c in list(vit.children())[-3]:
-            for p in c.parameters():
-                p.requires_grad = fine_tune
+        transformer = list(vit.children())[-3]
+        for p in transformer.parameters():
+            p.requires_grad = fine_tune
 
 
 class Attention(nn.Module):

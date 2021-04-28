@@ -1,5 +1,6 @@
 import os
 
+import copy
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -19,7 +20,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def caption_image_beam_search(encoder, decoder, image_path, word_map,
-                              beam_size=3, use_clip=True):
+                              beam_size=3, use_clip=True, clip_beam_search=True):
     """
     Reads an image and captions it with beam search.
 
@@ -88,34 +89,47 @@ def caption_image_beam_search(encoder, decoder, image_path, word_map,
     h, c = decoder.init_hidden_state(encoder_out)
 
     rev_word_map = {v: k for k, v in word_map.items()}
+    if clip_beam_search:
+        with torch.no_grad():
+            image_features = encoder.clip_model.encode_image(image)
+            image_features /= image_features.norm(dim=-1, keepdim=True)
 
     def get_clip_scores(seqs, scores):
-        special_words = ['<unk>', '<start>', '<end>', '<pad>']
+        nonlocal top_k_scores
+        special_words = ['<start>', '<end>']
+        replace_words = {'<unk>': '<averyunpleasantword>', '<pad>': '<anotherveryunpleasantword>'}
         special_words_enc = [word_map[w] for w in special_words]
         if step == 1:
-            next_word_inds = scores[0].topk(k, 0, True, True)[1]  # (s)
+            top_k_scores, next_word_inds = scores[0].topk(k, 0, True, True)  # (s)
             return torch.zeros(k, device=device).long(), next_word_inds
         next_word_inds = scores.topk(k)[1]
         inds = []
 
         text = []
+        weights = torch.ones(k**2).to(device)
+        count = 0
         for idx, (prev_seq, next_words) in enumerate(zip(seqs.tolist(), next_word_inds.tolist())):
             prev_words = [rev_word_map[w] for w in prev_seq if w not in special_words_enc]
             for word in next_words:
-                cap_words = prev_words + [rev_word_map[w] for w in [word] if w not in special_words_enc]
+                cap_words = copy.copy(prev_words)
+                if word not in special_words:
+                    word_char = rev_word_map[word]
+                    word_char = replace_words.get(word_char) or word_char
+                    cap_words.append(word_char)
                 text.append(' '.join(cap_words))
                 inds.append([idx, word])
+                if rev_word_map[word] == '<end>':
+                    weights[count] = 1.5
+                count += 1
         inds = np.array(inds)
         text = clip.tokenize(text).to(device)
         with torch.no_grad():
-            image_features = encoder.clip_model.encode_image(image)
             text_features = encoder.clip_model.encode_text(text)
 
         # Pick the top k most similar captions for the image
-        image_features /= image_features.norm(dim=-1, keepdim=True)
         text_features /= text_features.norm(dim=-1, keepdim=True)
-        similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
-        indices = similarity.view(-1).topk(k, 0)[1]
+        similarity = (image_features @ text_features.T * weights).log_softmax(dim=-1)
+        top_k_scores, indices = similarity.view(-1).topk(k, 0, True, True)
         prev_inds = torch.tensor([inds[idx][0] for idx in indices], device=device)
         next_inds = torch.tensor([inds[idx][1] for idx in indices], device=device)
 
@@ -137,14 +151,13 @@ def caption_image_beam_search(encoder, decoder, image_path, word_map,
         h, c = decoder.decode_step(torch.cat([embeddings, awe], dim=1), (h, c))  # (s, decoder_dim)
 
         scores = decoder.fc(h)  # (s, vocab_size)
-        if use_clip:
+        scores = F.log_softmax(scores, dim=1)
+
+        # Add
+        scores = top_k_scores.expand_as(scores) + scores  # (s, vocab_size)
+        if clip_beam_search:
             prev_word_inds, next_word_inds = get_clip_scores(seqs, scores)
         else:
-            scores = F.log_softmax(scores, dim=1)
-
-            # Add
-            scores = top_k_scores.expand_as(scores) + scores  # (s, vocab_size)
-
             # For the first step, all k points will have the same scores (since same k previous words, h, c)
             if step == 1:
                 top_k_scores, top_k_words = scores[0].topk(k, 0, True, True)  # (s)
@@ -189,9 +202,14 @@ def caption_image_beam_search(encoder, decoder, image_path, word_map,
             break
         step += 1
 
-    i = complete_seqs_scores.index(max(complete_seqs_scores))
-    seq = complete_seqs[i]
-    alphas = complete_seqs_alpha[i]
+    if len(complete_inds) > 0:
+        i = complete_seqs_scores.index(max(complete_seqs_scores))
+        seq = complete_seqs[i]
+        alphas = complete_seqs_alpha[i]
+    else:
+        i = top_k_scores.argmax().item()
+        seq = seqs[i].tolist()
+        alphas = seqs_alpha[i].tolist()
 
     return seq, alphas
 
@@ -237,12 +255,13 @@ def visualize_att(image_path, seq, alphas, rev_word_map, smooth=True):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Show, Attend, and Tell - Tutorial - Generate Caption')
 
-    parser.add_argument('--use_clip', help='Use CLIP', type=bool, default=True)
+    parser.add_argument('--use_clip', help='Use CLIP', default=False, action='store_true')
     parser.add_argument('--img', '-i', help='path to image')
     parser.add_argument('--model', '-m', help='path to model')
     parser.add_argument('--clip_model', '-cm', help='path to CLIP model')
     parser.add_argument('--word_map', '-wm', help='path to word map JSON')
     parser.add_argument('--beam_size', '-b', default=5, type=int, help='beam size for beam search')
+    parser.add_argument('--clip_beam_search', '-cb', default=False, action='store_true', help='Use CLIP for beam search')
     parser.add_argument('--dont_smooth', dest='smooth', action='store_false', help='do not smooth alpha overlay')
 
     args = parser.parse_args()
@@ -267,7 +286,7 @@ if __name__ == '__main__':
     rev_word_map = {v: k for k, v in word_map.items()}  # ix2word
 
     # Encode, decode with attention and beam search
-    seq, alphas = caption_image_beam_search(encoder, decoder, args.img, word_map, args.beam_size, use_clip=args.use_clip)
+    seq, alphas = caption_image_beam_search(encoder, decoder, args.img, word_map, args.beam_size, use_clip=args.use_clip, clip_beam_search=args.clip_beam_search)
     alphas = torch.FloatTensor(alphas)
 
     # Visualize caption and attention of best sequence
