@@ -75,7 +75,7 @@ def main(use_clip=True):
                                              lr=encoder_lr) if fine_tune_encoder else None
 
     else:
-        clip_model_path = checkpoint.model[:-8] + '_clip.pt'
+        clip_model_path = checkpoint[:-8] + '_clip.pt'
         checkpoint = torch.load(checkpoint)
         start_epoch = checkpoint['epoch'] + 1
         epochs_since_improvement = checkpoint['epochs_since_improvement']
