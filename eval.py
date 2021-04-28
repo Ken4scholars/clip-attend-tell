@@ -1,3 +1,4 @@
+import copy
 import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
@@ -6,7 +7,7 @@ from clip import clip
 
 from datasets import *
 from utils import *
-from nltk.translate.bleu_score import corpus_bleu
+from nltk.translate.bleu_score import corpus_bleu, sentence_bleu, SmoothingFunction
 import torch.nn.functional as F
 from tqdm import tqdm
 
@@ -19,6 +20,7 @@ word_map_file = 'flickr/WORDMAP_flickr8k_5_cap_per_img_5_min_word_freq.json'  # 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # sets device for model and PyTorch tensors
 cudnn.benchmark = True  # set to true only if inputs to model are fixed size; otherwise lot of computational overhead
 use_clip = True
+clip_beam_search = True
 
 # Load model
 if not clip_checkpoint:
@@ -110,34 +112,47 @@ def evaluate(beam_size):
         h, c = decoder.init_hidden_state(encoder_out)
 
         rev_word_map = {v: k for k, v in word_map.items()}
+        if clip_beam_search:
+            with torch.no_grad():
+                image_features = encoder.clip_model.encode_image(image)
+                image_features /= image_features.norm(dim=-1, keepdim=True)
 
         def get_clip_scores(seqs, scores):
-            special_words = ['<unk>', '<start>', '<end>', '<pad>']
+            nonlocal top_k_scores
+            special_words = ['<start>', '<end>']
+            replace_words = {'<unk>': '<averyunpleasantword>', '<pad>': '<anotherveryunpleasantword>'}
             special_words_enc = [word_map[w] for w in special_words]
             if step == 1:
-                next_word_inds = scores[0].topk(k, 0, True, True)[1]  # (s)
+                top_k_scores, next_word_inds = scores[0].topk(k, 0, True, True)  # (s)
                 return torch.zeros(k, device=device).long(), next_word_inds
             next_word_inds = scores.topk(k)[1]
             inds = []
 
             text = []
+            weights = torch.ones(k ** 2).to(device)
+            count = 0
             for idx, (prev_seq, next_words) in enumerate(zip(seqs.tolist(), next_word_inds.tolist())):
                 prev_words = [rev_word_map[w] for w in prev_seq if w not in special_words_enc]
                 for word in next_words:
-                    cap_words = prev_words + [rev_word_map[w] for w in [word] if w not in special_words_enc]
+                    cap_words = copy.copy(prev_words)
+                    if word not in special_words:
+                        word_char = rev_word_map[word]
+                        word_char = replace_words.get(word_char) or word_char
+                        cap_words.append(word_char)
                     text.append(' '.join(cap_words))
                     inds.append([idx, word])
+                    if rev_word_map[word] == '<end>':
+                        weights[count] = 1.5
+                    count += 1
             inds = np.array(inds)
             text = clip.tokenize(text).to(device)
             with torch.no_grad():
-                image_features = encoder.clip_model.encode_image(image)
                 text_features = encoder.clip_model.encode_text(text)
 
             # Pick the top k most similar captions for the image
-            image_features /= image_features.norm(dim=-1, keepdim=True)
             text_features /= text_features.norm(dim=-1, keepdim=True)
-            similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
-            indices = similarity.view(-1).topk(k, 0)[1]
+            similarity = (image_features @ text_features.T * weights).log_softmax(dim=-1)
+            top_k_scores, indices = similarity.view(-1).topk(k, 0, True, True)
             prev_inds = torch.tensor([inds[idx][0] for idx in indices], device=device)
             next_inds = torch.tensor([inds[idx][1] for idx in indices], device=device)
 
@@ -156,13 +171,14 @@ def evaluate(beam_size):
             h, c = decoder.decode_step(torch.cat([embeddings, awe], dim=1), (h, c))  # (s, decoder_dim)
 
             scores = decoder.fc(h)  # (s, vocab_size)
-            if use_clip:
+            scores = F.log_softmax(scores, dim=1)
+
+            # Add
+            scores = top_k_scores.expand_as(scores) + scores  # (s, vocab_size)
+
+            if clip_beam_search:
                 prev_word_inds, next_word_inds = get_clip_scores(seqs, scores)
             else:
-                scores = F.log_softmax(scores, dim=1)
-
-                # Add
-                scores = top_k_scores.expand_as(scores) + scores  # (s, vocab_size)
 
                 # For the first step, all k points will have the same scores (since same k previous words, h, c)
                 if step == 1:
@@ -172,7 +188,7 @@ def evaluate(beam_size):
                     top_k_scores, top_k_words = scores.view(-1).topk(k, 0, True, True)  # (s)
 
                 # Convert unrolled indices to actual indices of scores
-                prev_word_inds = (top_k_words / vocab_size).long() # (s)
+                prev_word_inds = (top_k_words / vocab_size).long()  # (s)
                 next_word_inds = (top_k_words % vocab_size).long()  # (s)
 
             # Add new words to sequences
@@ -188,7 +204,6 @@ def evaluate(beam_size):
                 complete_seqs.extend(seqs[complete_inds].tolist())
                 complete_seqs_scores.extend(top_k_scores[complete_inds])
             k -= len(complete_inds)  # reduce beam length accordingly
-
             # Proceed with incomplete sequences
             if k == 0:
                 break
@@ -204,27 +219,32 @@ def evaluate(beam_size):
                 break
             step += 1
 
-        i = complete_seqs_scores.index(max(complete_seqs_scores))
-        seq = complete_seqs[i]
+        if len(complete_inds) > 0:
+            i = complete_seqs_scores.index(max(complete_seqs_scores))
+            seq = complete_seqs[i]
+        else:
+            i = top_k_scores.argmax().item()
+            seq = seqs[i].tolist()
 
         # References
         img_caps = allcaps[0].tolist()
         img_captions = list(
-            map(lambda c: [w for w in c if w not in {word_map['<start>'], word_map['<end>'], word_map['<pad>']}],
+            map(lambda c: [rev_word_map[w] for w in c if
+                           w not in {word_map['<start>'], word_map['<end>'], word_map['<pad>']}],
                 img_caps))  # remove <start> and pads
         references.append(img_captions)
 
         # Hypotheses
-        hypotheses.append([w for w in seq if w not in {word_map['<start>'], word_map['<end>'], word_map['<pad>']}])
+        hypotheses.append(
+            [rev_word_map[w] for w in seq if w not in {word_map['<start>'], word_map['<end>'], word_map['<pad>']}])
 
         assert len(references) == len(hypotheses)
 
-    # Calculate BLEU-4 scores
-    bleu4 = corpus_bleu(references, hypotheses)
+    bleu4 = corpus_bleu(references, hypotheses, smoothing_function=SmoothingFunction().method1)
 
     return bleu4
 
 
 if __name__ == '__main__':
-    beam_size = 1
+    beam_size = 5
     print("\nBLEU-4 score @ beam size of %d is %.4f." % (beam_size, evaluate(beam_size)))
