@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 import torchvision
 import clip
 
@@ -113,7 +114,7 @@ class CLIPEncoder(CLIPLoader, nn.Module):
         out = self.clip_model.encode_image(images).float()  # (batch_size, 512)
         out = out.view(out.shape[0], -1, 16, 16)  # (batch_size, 2, 16, 16)
         out = self.adaptive_pool(out)  # (batch_size, 2, encoded_image_size, encoded_image_size)
-        out = self.conv_out(out)  # (batch_size, 2048, encoded_image_size, encoded_image_size)
+        out = F.relu(self.conv_out(out))   # (batch_size, 2048, encoded_image_size, encoded_image_size)
         out = out.permute(0, 2, 3, 1)  # (batch_size, encoded_image_size, encoded_image_size, 2048)
         return out
 
